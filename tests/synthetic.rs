@@ -2,11 +2,15 @@
 
 //! Comprehensive synthetic unit and integration tests for `libhowl`.
 
+use std::collections::BTreeMap;
+
 use libhowl::{
     compute_melodic_pitch, compute_percussion_pitch, compute_stereo_volume, compute_tempo_fp16,
-    compute_wide_pitch, read_vlq, Error, HowlArchive, HowlArchiveView, HowlCommand, HowlPlayer,
-    RenderConfig, ReverbPreset, CENTER_PARAM, HOWL_SECTOR_SIZE, NOTE_PITCH_LUT,
+    compute_wide_pitch, read_vlq, Error, HowlArchive, HowlArchiveView, HowlCommand, HowlEvent,
+    HowlPlayer, InstrumentEntry, RenderConfig, ReverbPreset, Sequence, SongSet, SongSetHeader,
+    Track, CENTER_PARAM, HOWL_SECTOR_SIZE, NOTE_PITCH_LUT,
 };
+use libspu2::registers::ps1;
 use libspu2::StereoI16;
 
 fn make_looping_adpcm(blocks: usize) -> Vec<u8> {
@@ -472,4 +476,417 @@ fn rejects_invalid_render_config() {
         ..Default::default()
     };
     assert!(HowlPlayer::from_archive(&view, 0, 0, cfg).is_err());
+}
+
+fn minimal_song_set(
+    bpm: u16,
+    tpqn: u16,
+    instruments: Vec<InstrumentEntry>,
+    tracks: Vec<Track>,
+) -> SongSet {
+    SongSet {
+        header: SongSetHeader {
+            size: 64,
+            instrument_count: instruments.len() as u8,
+            percussion_count: 0,
+            sequence_count: 1,
+        },
+        instruments,
+        percussion: Vec::new(),
+        sequences: vec![Sequence {
+            flags: 0,
+            bpm,
+            tpqn,
+            tracks,
+        }],
+    }
+}
+
+fn default_inst(spu_index: u16, base_pitch: u16) -> InstrumentEntry {
+    InstrumentEntry {
+        flags: 0,
+        volume: 0xFF,
+        reserved: 0,
+        base_pitch,
+        spu_index,
+        adsr1: 0x80FF,
+        adsr2: 0x1FC2,
+    }
+}
+
+#[test]
+fn reverb_ram_overlap_guard_and_mvol_masking() {
+    // Upload a sample large enough to overlap ReverbPreset::Echo (0x18040 bytes at top of 512 KiB RAM,
+    // work_start = 0x80000 - 0x18040 = 0x67FC0), while still fitting below MAX_SPU_RAM_END (0x7E000).
+    let mut big_wave = make_looping_adpcm(27_000); // 432,000 bytes (0x69780), end = 0x6A790 > 0x67FC0
+    big_wave.truncate(0x69780);
+    let mut samples = BTreeMap::new();
+    samples.insert(0u16, big_wave);
+
+    let ss = minimal_song_set(
+        120,
+        48,
+        vec![default_inst(0, 0x1000)],
+        vec![Track {
+            flags: 0,
+            id: 0,
+            events: vec![
+                HowlEvent {
+                    delta: 0,
+                    command: HowlCommand::NoteOn {
+                        note: 60,
+                        velocity: 120,
+                    },
+                },
+                HowlEvent {
+                    delta: 16,
+                    command: HowlCommand::EndOfTrack,
+                },
+            ],
+        }],
+    );
+
+    // Echo work area overlaps uploaded sample -> reverb must be disabled automatically.
+    let cfg_echo = RenderConfig {
+        reverb_preset: ReverbPreset::Echo,
+        master_volume: 0xBFFF, // bit 15 set: must be masked to 0x3FFF
+        target_loops: 0,
+        tail_seconds: 0.0,
+        ..Default::default()
+    };
+    let player_echo = HowlPlayer::from_parts(ss.clone(), 0, &samples, cfg_echo).unwrap();
+    assert!(!player_echo.reverb_active());
+    assert_eq!(
+        player_echo.device().read_ps1_register(ps1::MVOLL).unwrap(),
+        0x3FFF
+    );
+    assert_eq!(
+        player_echo.device().read_ps1_register(ps1::MVOLR).unwrap(),
+        0x3FFF
+    );
+
+    // Room work area (0x26C0, starts at 0x7D940 > 0x6A790) fits cleanly -> reverb active.
+    let cfg_room = RenderConfig {
+        reverb_preset: ReverbPreset::Room,
+        ..cfg_echo
+    };
+    let player_room = HowlPlayer::from_parts(ss, 0, &samples, cfg_room).unwrap();
+    assert!(player_room.reverb_active());
+}
+
+#[test]
+fn fade_out_leaves_mvol_untouched_and_supports_manual_and_zero_fade() {
+    let data = build_synthetic_howl();
+    let view = HowlArchiveView::parse(&data).unwrap();
+
+    let cfg = RenderConfig {
+        target_loops: 10,
+        fade_seconds: 0.2,
+        tail_seconds: 0.05,
+        max_seconds: 5.0,
+        ..Default::default()
+    };
+    let mut player = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+    assert_eq!(player.config(), cfg);
+    assert_eq!(player.song_set().sequences.len(), 1);
+    assert!(!player.is_fading());
+    assert_eq!(player.sequence_volume(), cfg.sequence_volume);
+
+    // Render a bit, then manually trigger fade-out.
+    let mut buf = [StereoI16::default(); 735];
+    player.render_samples(&mut buf).unwrap();
+    player.start_fade_out();
+    assert!(player.is_fading());
+
+    let mut prev_vol = player.sequence_volume();
+    while player.is_fading() {
+        player.render_samples(&mut buf).unwrap();
+        let cur = player.sequence_volume();
+        assert!(cur <= prev_vol, "fade volume must be monotonic");
+        prev_vol = cur;
+        assert_eq!(player.device().read_ps1_register(ps1::MVOLL).unwrap(), 0x3FFF);
+        assert_eq!(player.device().read_ps1_register(ps1::MVOLR).unwrap(), 0x3FFF);
+    }
+    assert_eq!(player.sequence_volume(), 0);
+    assert!(player.frames_rendered() > 0);
+
+    // Zero fade + zero tail finishes immediately after target_loops.
+    let cfg_zero = RenderConfig {
+        target_loops: 1,
+        fade_seconds: 0.0,
+        tail_seconds: 0.0,
+        max_seconds: 5.0,
+        ..Default::default()
+    };
+    let mut p0 = HowlPlayer::from_archive(&view, 0, 0, cfg_zero).unwrap();
+    let res = p0.render_all().unwrap();
+    assert!(res.faded_out);
+    assert_eq!(p0.loops_completed(), res.loops_completed);
+    assert!(p0.is_finished());
+}
+
+#[test]
+fn mute_beats_solo_and_flushes_immediately() {
+    let data = build_synthetic_howl();
+    let view = HowlArchiveView::parse(&data).unwrap();
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.1,
+        max_seconds: 2.0,
+        ..Default::default()
+    };
+    let mut player = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+
+    // Solo track 0 AND explicitly mute track 0 -> mute must win!
+    player.set_solo_mask(0b01);
+    player.set_track_muted(0, true);
+    assert_eq!(player.solo_mask(), 0b01);
+    assert_eq!(player.mute_mask(), 0b01);
+    assert!(player.track_snapshot(0).unwrap().muted);
+    assert!(player.track_snapshot(1).unwrap().muted);
+
+    // Render a tick so track 0 triggers its note; because it is muted, voice volume is 0.
+    let mut buf = [StereoI16::default(); 735];
+    player.render_samples(&mut buf).unwrap();
+    assert!(buf.iter().all(|s| s.left == 0 && s.right == 0));
+
+    // Unmute track 0 -> SPU volume must flush immediately before next tick.
+    player.set_track_muted(0, false);
+    assert!(!player.track_snapshot(0).unwrap().muted);
+    let voice = player.track_snapshot(0).unwrap().voice.unwrap();
+    let base = (voice as u32) * ps1::VOICE_STRIDE;
+    let voll = player.device().read_ps1_register(base + ps1::V_VOLL).unwrap();
+    assert_ne!(voll, 0, "unmuting must immediately flush V_VOLL to SPU");
+}
+
+#[test]
+fn f32_buffer_validation_and_zero_alloc_equivalence() {
+    let data = build_synthetic_howl();
+    let view = HowlArchiveView::parse(&data).unwrap();
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.02,
+        max_seconds: 1.0,
+        ..Default::default()
+    };
+    let mut p_i16 = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+    let mut p_planar = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+    let mut p_inter = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+
+    // Mismatched planar lengths -> InvalidArgument.
+    let mut l_short = [0.0f32; 16];
+    let mut r_long = [0.0f32; 32];
+    assert!(matches!(
+        p_planar.render_f32_planar(&mut l_short, &mut r_long),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // Odd interleaved length -> InvalidArgument.
+    let mut odd = [0.0f32; 15];
+    assert!(matches!(
+        p_inter.render_f32_interleaved(&mut odd),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // Compare rendered frames across all three APIs.
+    let mut s_i16 = [StereoI16::default(); 1024];
+    let mut left = [0.0f32; 1024];
+    let mut right = [0.0f32; 1024];
+    let mut inter = [0.0f32; 2048];
+    let n1 = p_i16.render_samples(&mut s_i16).unwrap();
+    let n2 = p_planar.render_f32_planar(&mut left, &mut right).unwrap();
+    let n3 = p_inter.render_f32_interleaved(&mut inter).unwrap();
+    assert_eq!(n1, n2);
+    assert_eq!(n2, n3);
+    for i in 0..n1 {
+        assert!((left[i] - inter[i * 2]).abs() < 1e-6);
+        assert!((right[i] - inter[i * 2 + 1]).abs() < 1e-6);
+        assert!((left[i] - f32::from(s_i16[i].left) / 32768.0).abs() <= 1.0 / 32768.0 + 1e-5);
+    }
+}
+
+#[test]
+fn voice_stealing_and_sustaining_pitch_bend_across_instrument_switch() {
+    let mut samples = BTreeMap::new();
+    samples.insert(0u16, make_looping_adpcm(8));
+
+    // 2 instruments with distinct base_pitch: inst 0 = 0x1000, inst 1 = 0x2000.
+    // Track 0 triggers note 60 with inst 0, switches to inst 1, then bends pitch.
+    // The sustaining voice must still bend relative to inst 0 (0x1000), not inst 1 (0x2000)!
+    let ss_bend = minimal_song_set(
+        120,
+        48,
+        vec![default_inst(0, 0x1000), default_inst(0, 0x2000)],
+        vec![Track {
+            flags: 0,
+            id: 0,
+            events: vec![
+                HowlEvent {
+                    delta: 0,
+                    command: HowlCommand::SetInstrument(0),
+                },
+                HowlEvent {
+                    delta: 0,
+                    command: HowlCommand::NoteOn {
+                        note: 60,
+                        velocity: 120,
+                    },
+                },
+                HowlEvent {
+                    delta: 2,
+                    command: HowlCommand::SetInstrument(1),
+                },
+                HowlEvent {
+                    delta: 2,
+                    command: HowlCommand::SetPitchBend(0x90),
+                },
+                HowlEvent {
+                    delta: 16,
+                    command: HowlCommand::EndOfTrack,
+                },
+            ],
+        }],
+    );
+    let mut player = HowlPlayer::from_parts(
+        ss_bend,
+        0,
+        &samples,
+        RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut buf = [StereoI16::default(); 735 * 6];
+    player.render_samples(&mut buf).unwrap();
+    let voice = player.track_snapshot(0).unwrap().voice.unwrap();
+    let actual_pitch = player
+        .device()
+        .read_ps1_register((voice as u32) * ps1::VOICE_STRIDE + ps1::V_PITCH)
+        .unwrap();
+    let expected_pitch = compute_melodic_pitch(0x1000, 60, 0x90);
+    assert_eq!(actual_pitch, expected_pitch);
+
+    // >24 simultaneous NoteOns on a single tick must not panic or steal same-tick KON slots.
+    let mut events = vec![HowlEvent {
+        delta: 0,
+        command: HowlCommand::SetInstrument(0),
+    }];
+    for note in 36..66u8 {
+        events.push(HowlEvent {
+            delta: 0,
+            command: HowlCommand::NoteOn {
+                note,
+                velocity: 100,
+            },
+        });
+    }
+    events.push(HowlEvent {
+        delta: 8,
+        command: HowlCommand::NoteOff { note: 36 },
+    });
+    events.push(HowlEvent {
+        delta: 8,
+        command: HowlCommand::NoteOn {
+            note: 72,
+            velocity: 100,
+        },
+    });
+    events.push(HowlEvent {
+        delta: 8,
+        command: HowlCommand::EndOfTrack,
+    });
+    let ss_poly = minimal_song_set(
+        120,
+        48,
+        vec![default_inst(0, 0x1000)],
+        vec![Track {
+            flags: 0,
+            id: 0,
+            events,
+        }],
+    );
+    let mut p_poly = HowlPlayer::from_parts(
+        ss_poly,
+        0,
+        &samples,
+        RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.02,
+            max_seconds: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let res = p_poly.render_all().unwrap();
+    assert!(res.reached_end);
+    assert!(res.samples.iter().any(|&s| s != 0));
+}
+
+#[test]
+fn zero_delay_loop_guard_zero_tempo_guard_and_non_standard_rates() {
+    let mut samples = BTreeMap::new();
+    samples.insert(0u16, make_looping_adpcm(8));
+
+    // Zero-delay EndOfTrack loop with target_loops > 0 must halt cleanly with 0 loops_completed.
+    let ss_zero_loop = minimal_song_set(
+        120,
+        48,
+        vec![default_inst(0, 0x1000)],
+        vec![Track {
+            flags: 0,
+            id: 0,
+            events: vec![
+                HowlEvent {
+                    delta: 0,
+                    command: HowlCommand::Nop,
+                },
+                HowlEvent {
+                    delta: 0,
+                    command: HowlCommand::EndOfTrack,
+                },
+            ],
+        }],
+    );
+    let mut p_zl = HowlPlayer::from_parts(
+        ss_zero_loop,
+        0,
+        &samples,
+        RenderConfig {
+            target_loops: 2,
+            tail_seconds: 0.0,
+            max_seconds: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let res = p_zl.render_all().unwrap();
+    assert!(res.reached_end);
+    assert_eq!(res.loops_completed, 0);
+    assert_eq!(res.frames_rendered, 0);
+
+    // bpm == 0 or tpqn == 0 must be rejected.
+    let ss_bad_bpm = minimal_song_set(0, 48, vec![], vec![]);
+    assert!(HowlPlayer::from_parts(ss_bad_bpm, 0, &samples, RenderConfig::default()).is_err());
+    let ss_bad_tpqn = minimal_song_set(120, 0, vec![], vec![]);
+    assert!(HowlPlayer::from_parts(ss_bad_tpqn, 0, &samples, RenderConfig::default()).is_err());
+
+    // Non-44.1 kHz (48000 Hz) and non-60 Hz (50 Hz, 120 Hz) timing.
+    let data = build_synthetic_howl();
+    let view = HowlArchiveView::parse(&data).unwrap();
+    for (sample_rate, tick_hz) in [(48_000, 60), (44_100, 50), (44_100, 120)] {
+        let cfg = RenderConfig {
+            sample_rate,
+            tick_hz,
+            target_loops: 0,
+            tail_seconds: 0.02,
+            max_seconds: 3.0,
+            ..Default::default()
+        };
+        let mut p = HowlPlayer::from_archive(&view, 0, 0, cfg).unwrap();
+        let r = p.render_all().unwrap();
+        assert!(r.reached_end, "failed for {sample_rate}Hz @ {tick_hz}Hz");
+        assert!(r.samples.iter().any(|&s| s != 0));
+    }
 }

@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![doc = include_str!("../README.md")]
+#![cfg_attr(feature = "alloc", doc = include_str!("../README.md"))]
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "Pure-Rust PlayStation 1 `HOWL` audio bank and music sequencer built on `libspu2`.\n\n\
+           Built without the `alloc` feature: exposes zero-copy archive and sequence views \
+           (`HowlArchiveView`, `SampleBankView`, `SongSetView`, `SequenceView`, `TrackView`, \
+           `TrackEventIter`), pitch/pan/tempo helpers, `Error`/`Result`, and the 10 hardware \
+           SPU reverb presets (`ReverbPreset`, `ReverbParams`). Enable the `alloc` or `std` \
+           feature for owned containers (`HowlArchive`, `SongSet`) and `HowlPlayer`."
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -26,7 +35,7 @@ pub use bank::{
 };
 #[cfg(feature = "alloc")]
 pub use player::{
-    compute_tempo_fp16, HowlPlayer, RenderConfig, RenderResult, SpuUploadSummary, TrackSnapshot,
+    HowlPlayer, RenderConfig, RenderResult, SpuUploadSummary, TrackSnapshot,
     DEFAULT_MUSIC_VOLUME, DEFAULT_PERCUSSION_ADSR1, DEFAULT_PERCUSSION_ADSR2,
     DEFAULT_SEQUENCE_VOLUME, DEFAULT_SFX_VOLUME, DEFAULT_SPU_RAM_BASE, HOWL_TICK_HZ,
     MAX_SPU_RAM_END,
@@ -40,9 +49,9 @@ pub use sequence::{
     PERCUSSION_ENTRY_SIZE, SEQUENCE_HEADER_SIZE, SONG_SET_HEADER_SIZE, TRACK_FLAG_PERCUSSION,
 };
 pub use tables::{
-    compute_melodic_pitch, compute_percussion_pitch, compute_stereo_volume, compute_wide_pitch,
-    CENTER_PARAM, FINE_PITCH_LUT, MAX_SPU_VOLUME, NOTE_PITCH_LUT, PAN_LUT, PITCH_SCALE_1OCT_LUT,
-    PITCH_SCALE_2OCT_LUT,
+    compute_melodic_pitch, compute_percussion_pitch, compute_stereo_volume, compute_tempo_fp16,
+    compute_wide_pitch, CENTER_PARAM, FINE_PITCH_LUT, MAX_SPU_VOLUME, NOTE_PITCH_LUT, PAN_LUT,
+    PITCH_SCALE_1OCT_LUT, PITCH_SCALE_2OCT_LUT,
 };
 
 /// Crate-wide result type alias for `libhowl`.

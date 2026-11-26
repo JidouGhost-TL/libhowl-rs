@@ -390,7 +390,16 @@ impl<'a> SequenceView<'a> {
             track_data_offset,
         };
         for i in 0..usize::from(track_count) {
-            let _ = seq.track(i)?;
+            let trk = seq.track(i)?;
+            let mut saw_eot = false;
+            for ev in trk.events() {
+                if matches!(ev?.command, HowlCommand::EndOfTrack) {
+                    saw_eot = true;
+                }
+            }
+            if !saw_eot {
+                return Err(Error::UnexpectedEof("track missing EndOfTrack"));
+            }
         }
         Ok(seq)
     }
@@ -617,4 +626,59 @@ fn read_u32_le(data: &[u8], off: usize) -> Result<u32> {
         data[off + 2],
         data[off + 3],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_vlq_and_command_validation() {
+        assert_eq!(read_vlq(&[0x00]), Ok((0, 1)));
+        assert_eq!(read_vlq(&[0x7F]), Ok((127, 1)));
+        assert_eq!(read_vlq(&[0x81, 0x00]), Ok((128, 2)));
+        assert!(read_vlq(&[]).is_err());
+        assert!(read_vlq(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).is_err());
+
+        assert_eq!(HowlCommand::decode(&[0x03]), Ok((HowlCommand::EndOfTrack, 1)));
+        assert_eq!(
+            HowlCommand::decode(&[0x05, 60, 127]),
+            Ok((HowlCommand::NoteOn { note: 60, velocity: 127 }, 3))
+        );
+        assert!(HowlCommand::decode(&[0x0B]).is_err());
+        assert!(HowlCommand::decode(&[0x05, 60]).is_err());
+    }
+
+    #[test]
+    fn no_std_song_set_validates_track_bytecode() {
+        // Minimal valid SongSet: 8-byte header, 0 inst, 0 drum, 1 seq, seq offset 0 (aligned to 12),
+        // seq header (6 bytes) + 1 track offset (2 bytes) = 8 bytes (already 4-byte aligned),
+        // track: flags=0, id=0, delta=0, EndOfTrack (0x03).
+        let mut valid = [0u8; 24];
+        let total_len = valid.len() as u32;
+        valid[0..4].copy_from_slice(&total_len.to_le_bytes());
+        valid[6..8].copy_from_slice(&1u16.to_le_bytes()); // sequence_count = 1
+        // seq at offset 12:
+        valid[12] = 0; // flags
+        valid[13] = 1; // track_count = 1
+        valid[14..16].copy_from_slice(&120u16.to_le_bytes()); // bpm
+        valid[16..18].copy_from_slice(&48u16.to_le_bytes()); // tpqn
+        valid[18..20].copy_from_slice(&0u16.to_le_bytes()); // track 0 rel offset = 0
+        // track 0 at offset 20:
+        valid[20] = 0; // flags
+        valid[21] = 0; // id
+        valid[22] = 0; // delta = 0
+        valid[23] = 0x03; // EndOfTrack
+        assert!(SongSetView::parse(&valid).is_ok());
+
+        // Invalid opcode must be rejected by SongSetView::parse directly.
+        let mut bad_op = valid;
+        bad_op[23] = 0x7F;
+        assert!(SongSetView::parse(&bad_op).is_err());
+
+        // Missing EndOfTrack must be rejected by SongSetView::parse directly.
+        let mut no_eot = valid;
+        no_eot[23] = 0x00; // Nop without EndOfTrack
+        assert!(SongSetView::parse(&no_eot).is_err());
+    }
 }

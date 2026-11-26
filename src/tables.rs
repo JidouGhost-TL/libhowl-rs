@@ -152,7 +152,7 @@ pub const fn compute_melodic_pitch(base_pitch: u16, note: u8, pitch_bend: u8) ->
     let fine = (pitch_bend & 0x3F) as usize;
     if fine != 0 {
         let factor = (FINE_PITCH_LUT[fine] as u64) + 0x10_0000;
-        pitch = ((pitch & 0xFFFF) * factor) >> 20;
+        pitch = (pitch * factor) >> 20;
     }
     if pitch > 0x3FFF {
         0x3FFF
@@ -168,7 +168,11 @@ pub const fn compute_melodic_pitch(base_pitch: u16, note: u8, pitch_bend: u8) ->
 #[must_use]
 pub const fn compute_percussion_pitch(base_pitch: u16, pitch_bend: u8) -> u16 {
     if pitch_bend == CENTER_PARAM {
-        return base_pitch;
+        return if base_pitch > 0x3FFF {
+            0x3FFF
+        } else {
+            base_pitch
+        };
     }
     let scaled = ((base_pitch as u64) * (PITCH_SCALE_1OCT_LUT[pitch_bend as usize] as u64)) >> 16;
     if scaled > 0x3FFF {
@@ -183,7 +187,11 @@ pub const fn compute_percussion_pitch(base_pitch: u16, pitch_bend: u8) -> u16 {
 #[must_use]
 pub const fn compute_wide_pitch(base_pitch: u16, pitch_bend: u8) -> u16 {
     if pitch_bend == CENTER_PARAM {
-        return base_pitch;
+        return if base_pitch > 0x3FFF {
+            0x3FFF
+        } else {
+            base_pitch
+        };
     }
     let scaled = ((base_pitch as u64) * (PITCH_SCALE_2OCT_LUT[pitch_bend as usize] as u64)) >> 16;
     if scaled > 0x3FFF {
@@ -191,6 +199,17 @@ pub const fn compute_wide_pitch(base_pitch: u16, pitch_bend: u8) -> u16 {
     } else {
         scaled as u16
     }
+}
+
+/// Computes the 16.16 fixed-point ticks-per-frame increment `(((bpm * tpqn) / 60) << 16) / tick_hz`.
+#[inline]
+#[must_use]
+pub const fn compute_tempo_fp16(bpm: u16, tpqn: u16, tick_hz: u32) -> u32 {
+    if tick_hz == 0 {
+        return 0;
+    }
+    let ticks_per_sec = ((bpm as u64) * (tpqn as u64)) / 60;
+    ((ticks_per_sec << 16) / (tick_hz as u64)) as u32
 }
 
 /// Applies constant-power stereo panning to a clamped SPU voice volume.
@@ -209,4 +228,36 @@ pub const fn compute_stereo_volume(volume: u32, pan: u8, stereo: bool) -> (i16, 
     let left = ((clamped * (PAN_LUT[255 - pan as usize] as u32)) >> 8) as i16;
     let right = ((clamped * (PAN_LUT[pan as usize] as u32)) >> 8) as i16;
     (left, right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_pitch_clamping_and_no_wraparound() {
+        // Center bend must still clamp out-of-range base_pitch to 0x3FFF.
+        assert_eq!(compute_percussion_pitch(0xFFFF, CENTER_PARAM), 0x3FFF);
+        assert_eq!(compute_wide_pitch(0xFFFF, CENTER_PARAM), 0x3FFF);
+        assert_eq!(compute_melodic_pitch(0xFFFF, 60, CENTER_PARAM), 0x3FFF);
+
+        // High note + high base_pitch + fine bend must saturate at 0x3FFF, never wrap.
+        assert_eq!(compute_melodic_pitch(0xFFFF, 107, 0xFF), 0x3FFF);
+        assert_eq!(compute_melodic_pitch(0x3FFF, 107, 0x9F), 0x3FFF);
+        assert_eq!(compute_melodic_pitch(0x1000, 0, 0), NOTE_PITCH_LUT[0]);
+
+        // Tempo math works in bare no_std.
+        assert_eq!(compute_tempo_fp16(120, 48, 60), (96u32 << 16) / 60);
+        assert_eq!(compute_tempo_fp16(120, 48, 0), 0);
+    }
+
+    #[test]
+    fn no_std_stereo_volume_bounds() {
+        let (l, r) = compute_stereo_volume(u32::MAX, CENTER_PARAM, true);
+        assert!(l > 0 && l <= 0x3FFF);
+        assert!(r > 0 && r <= 0x3FFF);
+        let (ml, mr) = compute_stereo_volume(u32::MAX, 0, false);
+        assert_eq!(ml, 0x3FFF);
+        assert_eq!(mr, 0x3FFF);
+    }
 }

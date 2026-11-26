@@ -376,6 +376,9 @@ impl<'a> HowlArchiveView<'a> {
         let sector = self
             .bank_sector(index)
             .ok_or(Error::OutOfRange("bank index"))?;
+        if sector == 0 {
+            return Err(Error::InvalidHeader("bank sector cannot be zero"));
+        }
         let base = usize::from(sector)
             .checked_mul(HOWL_SECTOR_SIZE)
             .ok_or(Error::OutOfRange("bank byte offset"))?;
@@ -422,6 +425,9 @@ impl<'a> HowlArchiveView<'a> {
         let sector = self
             .song_set_sector(index)
             .ok_or(Error::OutOfRange("song set index"))?;
+        if sector == 0 {
+            return Err(Error::InvalidHeader("song set sector cannot be zero"));
+        }
         let base = usize::from(sector)
             .checked_mul(HOWL_SECTOR_SIZE)
             .ok_or(Error::OutOfRange("song set byte offset"))?;
@@ -451,6 +457,11 @@ impl<'a> HowlArchiveView<'a> {
         HowlArchive {
             raw: self.data.to_vec(),
             header: self.header,
+            spu_table_off: self.spu_table_off,
+            sfx_table_off: self.sfx_table_off,
+            engine_sfx_table_off: self.engine_sfx_table_off,
+            bank_table_off: self.bank_table_off,
+            song_table_off: self.song_table_off,
         }
     }
 }
@@ -461,6 +472,11 @@ impl<'a> HowlArchiveView<'a> {
 pub struct HowlArchive {
     raw: Vec<u8>,
     header: HowlHeader,
+    spu_table_off: usize,
+    sfx_table_off: usize,
+    engine_sfx_table_off: usize,
+    bank_table_off: usize,
+    song_table_off: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -473,8 +489,22 @@ impl HowlArchive {
 
     /// Wraps an owned byte vector after validating it as a `HOWL` archive.
     pub fn from_vec(raw: Vec<u8>) -> Result<Self> {
-        let header = HowlArchiveView::parse(&raw)?.header();
-        Ok(Self { raw, header })
+        let view = HowlArchiveView::parse(&raw)?;
+        let header = view.header;
+        let spu_table_off = view.spu_table_off;
+        let sfx_table_off = view.sfx_table_off;
+        let engine_sfx_table_off = view.engine_sfx_table_off;
+        let bank_table_off = view.bank_table_off;
+        let song_table_off = view.song_table_off;
+        Ok(Self {
+            raw,
+            header,
+            spu_table_off,
+            sfx_table_off,
+            engine_sfx_table_off,
+            bank_table_off,
+            song_table_off,
+        })
     }
 
     /// Returns the parsed [`HowlHeader`].
@@ -484,13 +514,18 @@ impl HowlArchive {
         self.header
     }
 
-    /// Borrows a validated [`HowlArchiveView`] over this owned archive.
+    /// Borrows a validated [`HowlArchiveView`] over this owned archive in O(1) time.
+    #[inline]
     #[must_use]
     pub fn view(&self) -> HowlArchiveView<'_> {
-        // Safe: `raw` was already validated at construction time.
-        match HowlArchiveView::parse(&self.raw) {
-            Ok(v) => v,
-            Err(_) => unreachable!("validated HowlArchive invariant"),
+        HowlArchiveView {
+            data: &self.raw,
+            header: self.header,
+            spu_table_off: self.spu_table_off,
+            sfx_table_off: self.sfx_table_off,
+            engine_sfx_table_off: self.engine_sfx_table_off,
+            bank_table_off: self.bank_table_off,
+            song_table_off: self.song_table_off,
         }
     }
 
@@ -516,4 +551,40 @@ fn read_u32_le(data: &[u8], off: usize) -> Result<u32> {
         data[off + 2],
         data[off + 3],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_bank_rejects_invalid_and_sector_zero() {
+        assert!(!HowlArchiveView::detect(&[]));
+        assert_eq!(HowlArchiveView::parse(b"NOPE"), Err(Error::UnexpectedEof("HOWL header")));
+
+        // Minimal 3-sector archive with bank at sector 0 must be rejected.
+        let mut buf = [0u8; HOWL_SECTOR_SIZE * 3];
+        buf[0x00..0x04].copy_from_slice(&HOWL_MAGIC);
+        buf[0x04..0x08].copy_from_slice(&128u32.to_le_bytes()); // version
+        buf[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // spu_entry_count
+        buf[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes()); // bank_count
+        buf[0x24..0x28].copy_from_slice(&6u32.to_le_bytes()); // 1*4 + 1*2
+        // SPU entry 0: size_div8 = 2 (16 bytes)
+        buf[0x2A..0x2C].copy_from_slice(&2u16.to_le_bytes());
+        // Bank sector 0 -> invalid
+        buf[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            HowlArchiveView::parse(&buf),
+            Err(Error::InvalidHeader(_))
+        ));
+
+        // Move bank to sector 1 (ADPCM at sector 2) -> valid!
+        buf[0x2C..0x2E].copy_from_slice(&1u16.to_le_bytes());
+        buf[HOWL_SECTOR_SIZE..HOWL_SECTOR_SIZE + 2].copy_from_slice(&1u16.to_le_bytes());
+        buf[HOWL_SECTOR_SIZE + 2..HOWL_SECTOR_SIZE + 4].copy_from_slice(&0u16.to_le_bytes());
+        let view = HowlArchiveView::parse(&buf).unwrap();
+        assert_eq!(view.header().bank_count, 1);
+        assert_eq!(view.bank(0).unwrap().sample_count(), 1);
+        assert_eq!(view.find_sample_adpcm(0).unwrap().len(), 16);
+    }
 }

@@ -3,17 +3,19 @@
 //! `HOWL` music sequencer and 24-voice PlayStation 1 SPU player driving
 //! [`libspu2::Device::new_ps1()`].
 
-use alloc::collections::BTreeMap;
-use alloc::vec;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::fmt;
 
 use libspu2::registers::{ps1, CONTROL_ENABLE, CONTROL_REVERB, CONTROL_UNMUTE};
-use libspu2::{Device, StereoI16, VoiceState, PS1_RAM_SIZE, PS1_SAMPLE_RATE, VOICES_PER_CORE};
+use libspu2::{
+    Device, EnvelopePhase, StereoI16, VoiceState, PS1_RAM_SIZE, PS1_SAMPLE_RATE, VOICES_PER_CORE,
+};
 
 use crate::bank::{HowlArchiveView, SfxEntry};
 use crate::reverb::{ReverbParams, ReverbPreset};
 use crate::sequence::{HowlCommand, SongSet};
+pub use crate::tables::compute_tempo_fp16;
 use crate::tables::{
     compute_melodic_pitch, compute_percussion_pitch, compute_stereo_volume, CENTER_PARAM,
 };
@@ -177,6 +179,7 @@ struct TrackRuntime {
     active: bool,
     percussion: bool,
     loop_enabled: bool,
+    pass_had_time: bool,
     id: u8,
     instrument: u8,
     reverb: bool,
@@ -202,8 +205,10 @@ struct ActiveVoice {
     note: u8,
     velocity: u8,
     instrument_volume: u8,
+    base_pitch: u16,
     duration_remaining: u16,
     age: u64,
+    released: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -290,26 +295,48 @@ impl HowlPlayer {
         }
 
         // Collect all unique SPU sample IDs referenced by instruments and percussion.
-        let mut needed_ids = Vec::new();
+        let mut needed_ids = BTreeSet::new();
         for inst in &song_set.instruments {
-            if !needed_ids.contains(&inst.spu_index) {
-                needed_ids.push(inst.spu_index);
-            }
+            needed_ids.insert(inst.spu_index);
         }
         for drum in &song_set.percussion {
-            if !needed_ids.contains(&drum.spu_index) {
-                needed_ids.push(drum.spu_index);
+            needed_ids.insert(drum.spu_index);
+        }
+
+        // Single-pass scan over each sample bank, borrowing ADPCM slices directly without cloning.
+        let mut samples: BTreeMap<u16, &[u8]> = BTreeMap::new();
+        let bank_count = archive.header().bank_count as usize;
+        for bi in 0..bank_count {
+            if samples.len() >= needed_ids.len() {
+                break;
+            }
+            let Ok(bank) = archive.bank(bi) else {
+                continue;
+            };
+            let adpcm_data = bank.adpcm_data();
+            let mut cursor = 0usize;
+            for slot in 0..bank.sample_count() {
+                let Some(sid) = bank.sample_id(slot) else {
+                    break;
+                };
+                let Some(entry) = archive.spu_entry(usize::from(sid)) else {
+                    break;
+                };
+                let len = entry.byte_len();
+                let Some(end) = cursor.checked_add(len) else {
+                    break;
+                };
+                if end > adpcm_data.len() {
+                    break;
+                }
+                if needed_ids.contains(&sid) && !samples.contains_key(&sid) {
+                    samples.insert(sid, &adpcm_data[cursor..end]);
+                }
+                cursor = end;
             }
         }
 
-        let mut samples = BTreeMap::new();
-        for sid in needed_ids {
-            if let Some(adpcm) = archive.find_sample_adpcm(sid) {
-                samples.insert(sid, adpcm.to_vec());
-            }
-        }
-
-        Self::from_parts(song_set, sequence_index, &samples, config)
+        Self::from_slices(song_set, sequence_index, samples.into_iter(), config)
     }
 
     /// Creates a new [`HowlPlayer`] from an owned [`SongSet`] and an explicit
@@ -320,9 +347,36 @@ impl HowlPlayer {
         samples: &BTreeMap<u16, Vec<u8>>,
         config: RenderConfig,
     ) -> Result<Self> {
+        Self::from_slices(
+            song_set,
+            sequence_index,
+            samples.iter().map(|(&sid, buf)| (sid, buf.as_slice())),
+            config,
+        )
+    }
+
+    fn from_slices<'a>(
+        song_set: SongSet,
+        sequence_index: usize,
+        samples: impl Iterator<Item = (u16, &'a [u8])>,
+        config: RenderConfig,
+    ) -> Result<Self> {
         validate_config(&config)?;
         if sequence_index >= song_set.sequences.len() {
             return Err(Error::OutOfRange("sequence index out of range"));
+        }
+
+        let seq = &song_set.sequences[sequence_index];
+        if seq.bpm == 0 || seq.tpqn == 0 {
+            return Err(Error::InvalidArgument(
+                "sequence bpm and tpqn must be non-zero",
+            ));
+        }
+        let tempo_fp16 = compute_tempo_fp16(seq.bpm, seq.tpqn, config.tick_hz);
+        if tempo_fp16 == 0 {
+            return Err(Error::InvalidArgument(
+                "sequence tempo produces zero ticks per frame",
+            ));
         }
 
         let mut device = Device::new_ps1();
@@ -332,13 +386,19 @@ impl HowlPlayer {
 
         let mut sample_addrs = BTreeMap::new();
         let mut cursor = DEFAULT_SPU_RAM_BASE;
-        for (&sid, adpcm) in samples {
+        for (sid, adpcm) in samples {
             if adpcm.is_empty() {
                 continue;
             }
-            let aligned_len = (adpcm.len() + 7) & !7;
+            let aligned_len = adpcm
+                .len()
+                .checked_add(7)
+                .map(|n| n & !7)
+                .ok_or(Error::OutOfRange("ADPCM sample length overflow"))?;
+            let aligned_u32 = u32::try_from(aligned_len)
+                .map_err(|_| Error::OutOfRange("ADPCM sample length exceeds 32-bit SPU RAM"))?;
             let end = cursor
-                .checked_add(aligned_len as u32)
+                .checked_add(aligned_u32)
                 .ok_or(Error::OutOfRange("SPU RAM upload overflow"))?;
             if end > MAX_SPU_RAM_END {
                 return Err(Error::OutOfRange("SPU RAM capacity exceeded"));
@@ -354,8 +414,6 @@ impl HowlPlayer {
             sample_count: sample_addrs.len(),
         };
 
-        let seq = &song_set.sequences[sequence_index];
-        let tempo_fp16 = compute_tempo_fp16(seq.bpm, seq.tpqn, config.tick_hz);
         let initial_sequence_volume_fp16 = u32::from(config.sequence_volume) << 16;
         let fade_total_ticks = ((config.fade_seconds * f64::from(config.tick_hz)) + 0.5) as u32;
         let fade_step_fp16 = initial_sequence_volume_fp16
@@ -401,11 +459,39 @@ impl HowlPlayer {
         Ok(player)
     }
 
+    /// Returns a read-only reference to the underlying [`libspu2::Device`].
+    #[inline]
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Returns the active [`RenderConfig`].
+    #[inline]
+    #[must_use]
+    pub const fn config(&self) -> RenderConfig {
+        self.config
+    }
+
+    /// Returns a read-only reference to the loaded [`SongSet`].
+    #[inline]
+    #[must_use]
+    pub fn song_set(&self) -> &SongSet {
+        &self.song_set
+    }
+
     /// Returns the SPU RAM upload summary for this player.
     #[inline]
     #[must_use]
     pub const fn upload_summary(&self) -> &SpuUploadSummary {
         &self.upload
+    }
+
+    /// Returns `true` if hardware SPU reverb is currently active.
+    #[inline]
+    #[must_use]
+    pub const fn reverb_active(&self) -> bool {
+        self.reverb_active
     }
 
     /// Returns the number of tracks in the active sequence.
@@ -422,6 +508,34 @@ impl HowlPlayer {
         self.frames_rendered as f64 / f64::from(self.config.sample_rate)
     }
 
+    /// Returns cumulative stereo frames rendered so far.
+    #[inline]
+    #[must_use]
+    pub const fn frames_rendered(&self) -> u64 {
+        self.frames_rendered
+    }
+
+    /// Returns the number of completed sequence loops observed so far.
+    #[inline]
+    #[must_use]
+    pub const fn loops_completed(&self) -> u32 {
+        self.loops_completed
+    }
+
+    /// Returns the current per-sequence volume scalar (`0..=255`).
+    #[inline]
+    #[must_use]
+    pub const fn sequence_volume(&self) -> u8 {
+        (self.sequence_volume_fp16 >> 16) as u8
+    }
+
+    /// Returns `true` while the player is actively ramping down during fade-out.
+    #[inline]
+    #[must_use]
+    pub const fn is_fading(&self) -> bool {
+        matches!(self.phase, PlayPhase::Fading)
+    }
+
     /// Returns `true` if playback has finished (reached natural end, completed
     /// fade-out + tail, or hit `max_seconds`).
     #[inline]
@@ -430,18 +544,71 @@ impl HowlPlayer {
         matches!(self.phase, PlayPhase::Finished)
     }
 
-    /// Sets the track mute bitmask (`bit i = 1` mutes track `i`).
+    /// Returns the current track mute bitmask (`bit i = 1` means track `i` is muted).
+    #[inline]
+    #[must_use]
+    pub const fn mute_mask(&self) -> u64 {
+        self.mute_mask
+    }
+
+    /// Returns the current track solo bitmask (`0` disables solo).
+    #[inline]
+    #[must_use]
+    pub const fn solo_mask(&self) -> u64 {
+        self.solo_mask
+    }
+
+    /// Sets the track mute bitmask (`bit i = 1` mutes track `i`) and immediately
+    /// flushes updated voice volumes to the SPU.
     #[inline]
     pub fn set_mute_mask(&mut self, mask: u64) {
         self.mute_mask = mask;
         self.refresh_all_music_volumes();
+        let _ = self.commit_staged_registers();
     }
 
-    /// Sets the track solo bitmask (non-zero mutes every track whose bit is `0`).
+    /// Mutes or unmutes a single track (`0..64`) and immediately flushes updated
+    /// voice volumes to the SPU.
+    #[inline]
+    pub fn set_track_muted(&mut self, track: usize, muted: bool) {
+        if track >= 64 {
+            return;
+        }
+        let bit = 1u64 << track;
+        if muted {
+            self.mute_mask |= bit;
+        } else {
+            self.mute_mask &= !bit;
+        }
+        self.refresh_all_music_volumes();
+        let _ = self.commit_staged_registers();
+    }
+
+    /// Sets the track solo bitmask (non-zero mutes every track whose bit is `0`)
+    /// and immediately flushes updated voice volumes to the SPU.
     #[inline]
     pub fn set_solo_mask(&mut self, mask: u64) {
         self.solo_mask = mask;
         self.refresh_all_music_volumes();
+        let _ = self.commit_staged_registers();
+    }
+
+    /// Manually triggers a per-sequence-voice linear fade-out over
+    /// [`RenderConfig::fade_seconds`].
+    pub fn start_fade_out(&mut self) {
+        if self.phase == PlayPhase::Playing {
+            if self.fade_total_ticks == 0 {
+                self.sequence_volume_fp16 = 0;
+                self.faded_out = true;
+                self.refresh_all_music_volumes();
+                self.key_off_all_music();
+                self.enter_tail();
+                let _ = self.commit_staged_registers();
+            } else {
+                self.phase = PlayPhase::Fading;
+                self.fade_elapsed_ticks = 0;
+            }
+        }
     }
 
     /// Returns a read-only snapshot of track `index`, if in range.
@@ -453,7 +620,7 @@ impl HowlPlayer {
             .iter()
             .enumerate()
             .filter_map(|(vi, slot)| {
-                slot.filter(|v| v.kind == VoiceKind::Music && v.track_index == index)
+                slot.filter(|v| v.kind == VoiceKind::Music && v.track_index == index && !v.released)
                     .map(|v| (vi, v.age))
             })
             .max_by_key(|&(_, age)| age)
@@ -500,8 +667,10 @@ impl HowlPlayer {
             note: 0,
             velocity: volume,
             instrument_volume: sfx.volume,
+            base_pitch: sfx.base_pitch,
             duration_remaining: sfx.duration,
             age: self.voice_clock,
+            released: false,
         });
         let reg = &mut self.staged[voice_idx];
         reg.dirty |= DIRTY_ALL_NOTE_ON;
@@ -557,83 +726,85 @@ impl HowlPlayer {
     pub fn render_samples(&mut self, out: &mut [StereoI16]) -> Result<usize> {
         let mut written = 0usize;
         while written < out.len() && self.phase != PlayPhase::Finished {
-            let frames_until_tick = self.frames_until_next_tick();
-            let remaining_max = self.max_frames.saturating_sub(self.frames_rendered);
-            if remaining_max == 0 {
-                self.phase = PlayPhase::Finished;
+            let step = self.advance_until_renderable(out.len() - written)?;
+            if step == 0 {
                 break;
             }
-            let mut chunk = (out.len() - written)
-                .min(frames_until_tick.max(1) as usize)
-                .min(remaining_max as usize);
-            if self.phase == PlayPhase::Tail {
-                if self.tail_frames_remaining == 0 {
-                    self.phase = PlayPhase::Finished;
-                    break;
-                }
-                chunk = chunk.min(self.tail_frames_remaining as usize);
-            }
-
-            // Advance sequencer ticks due before rendering this chunk.
-            while self.sample_accum_num == 0 && self.phase != PlayPhase::Finished {
-                self.step_tick()?;
-                self.sample_accum_num += self.samples_per_tick_num;
-                if self.phase == PlayPhase::Tail || self.phase == PlayPhase::Finished {
-                    break;
-                }
-            }
-            if self.phase == PlayPhase::Finished {
-                break;
-            }
-
-            let step = chunk.min(self.frames_until_next_tick().max(1) as usize);
             self.device
                 .render_stereo(&mut out[written..written + step]);
             written += step;
-            self.frames_rendered += step as u64;
-            let consumed_num = (step as u64) * self.samples_per_tick_den;
-            self.sample_accum_num = self.sample_accum_num.saturating_sub(consumed_num);
-
-            if self.phase == PlayPhase::Tail {
-                self.tail_frames_remaining = self.tail_frames_remaining.saturating_sub(step as u64);
-                if self.tail_frames_remaining == 0 {
-                    self.phase = PlayPhase::Finished;
-                }
-            }
+            self.commit_rendered_frames(step);
         }
         Ok(written)
     }
 
-    /// Renders up to `left.len().min(right.len())` planar `f32` stereo frames in `[-1.0, 1.0]`.
+    /// Renders planar stereo `f32` PCM (`[-1.0, 1.0]`) into `left` and `right`
+    /// with zero heap allocation, returning the number of frames rendered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `left.len() != right.len()`, or
+    /// [`Error::Spu`] if an SPU register write or planar render call fails.
     pub fn render_f32_planar(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<usize> {
-        let n = left.len().min(right.len());
-        let mut tmp = vec![StereoI16::default(); n];
-        let rendered = self.render_samples(&mut tmp)?;
-        const SCALE: f32 = 1.0 / 32768.0;
-        for i in 0..rendered {
-            left[i] = f32::from(tmp[i].left) * SCALE;
-            right[i] = f32::from(tmp[i].right) * SCALE;
+        if left.len() != right.len() {
+            return Err(Error::InvalidArgument(
+                "planar left and right buffers must have equal length",
+            ));
         }
-        Ok(rendered)
+        let total = left.len();
+        let mut written = 0usize;
+        while written < total && self.phase != PlayPhase::Finished {
+            let step = self.advance_until_renderable(total - written)?;
+            if step == 0 {
+                break;
+            }
+            self.device
+                .render_f32_planar(&mut left[written..written + step], &mut right[written..written + step])?;
+            written += step;
+            self.commit_rendered_frames(step);
+        }
+        Ok(written)
     }
 
-    /// Renders interleaved `f32` stereo samples (`[L0, R0, ...]`), returning frames rendered.
+    /// Renders interleaved stereo `f32` PCM (`[L0, R0, ...]`) with zero heap
+    /// allocation, returning the number of stereo frames rendered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `out.len()` is odd, or
+    /// [`Error::Spu`] if an SPU register write or render call fails.
     pub fn render_f32_interleaved(&mut self, out: &mut [f32]) -> Result<usize> {
-        let frames = out.len() / 2;
-        let mut tmp = vec![StereoI16::default(); frames];
-        let rendered = self.render_samples(&mut tmp)?;
-        const SCALE: f32 = 1.0 / 32768.0;
-        for i in 0..rendered {
-            out[i * 2] = f32::from(tmp[i].left) * SCALE;
-            out[i * 2 + 1] = f32::from(tmp[i].right) * SCALE;
+        if out.len() % 2 != 0 {
+            return Err(Error::InvalidArgument(
+                "interleaved stereo buffer length must be even",
+            ));
         }
-        Ok(rendered)
+        let total_frames = out.len() / 2;
+        let mut written = 0usize;
+        let mut left_buf = [0.0f32; 256];
+        let mut right_buf = [0.0f32; 256];
+        while written < total_frames && self.phase != PlayPhase::Finished {
+            let n = (total_frames - written).min(256);
+            let got = self.render_f32_planar(&mut left_buf[..n], &mut right_buf[..n])?;
+            if got == 0 {
+                break;
+            }
+            for i in 0..got {
+                let dst = (written + i) * 2;
+                out[dst] = left_buf[i];
+                out[dst + 1] = right_buf[i];
+            }
+            written += got;
+        }
+        Ok(written)
     }
 
     /// Renders the complete sequence according to [`RenderConfig`] and returns
     /// interleaved 16-bit stereo PCM plus playback metadata.
     pub fn render_all(&mut self) -> Result<RenderResult> {
-        let mut samples = Vec::new();
+        let est_seconds = self.config.max_seconds.min(10.0);
+        let reserve_frames = (est_seconds * f64::from(self.config.sample_rate)) as usize;
+        let mut samples = Vec::with_capacity(reserve_frames.saturating_mul(2));
         let mut chunk = [StereoI16::default(); 512];
         while !self.is_finished() {
             let n = self.render_samples(&mut chunk)?;
@@ -655,12 +826,52 @@ impl HowlPlayer {
         })
     }
 
-    fn frames_until_next_tick(&self) -> u64 {
-        if self.sample_accum_num == 0 {
-            return 0;
+    /// Advances all due sequencer ticks before computing the next contiguous
+    /// render chunk, preserving exact fractional Bresenham remainder when
+    /// `sample_rate % tick_hz != 0`.
+    fn advance_until_renderable(&mut self, max_wanted: usize) -> Result<usize> {
+        loop {
+            if self.phase == PlayPhase::Finished || max_wanted == 0 {
+                return Ok(0);
+            }
+            let remaining_max = self.max_frames.saturating_sub(self.frames_rendered);
+            if remaining_max == 0 {
+                self.phase = PlayPhase::Finished;
+                return Ok(0);
+            }
+            if self.phase == PlayPhase::Tail {
+                if self.tail_frames_remaining == 0 {
+                    self.phase = PlayPhase::Finished;
+                    return Ok(0);
+                }
+                return Ok(max_wanted
+                    .min(remaining_max as usize)
+                    .min(self.tail_frames_remaining as usize));
+            }
+            if self.sample_accum_num < self.samples_per_tick_den {
+                self.step_tick()?;
+                self.sample_accum_num += self.samples_per_tick_num;
+                continue;
+            }
+            let frames_until_tick = self.sample_accum_num / self.samples_per_tick_den;
+            let chunk = max_wanted
+                .min(remaining_max as usize)
+                .min(frames_until_tick as usize);
+            return Ok(chunk);
         }
-        let den = self.samples_per_tick_den.max(1);
-        self.sample_accum_num.saturating_add(den - 1) / den
+    }
+
+    fn commit_rendered_frames(&mut self, step: usize) {
+        self.frames_rendered += step as u64;
+        if self.phase == PlayPhase::Tail {
+            self.tail_frames_remaining = self.tail_frames_remaining.saturating_sub(step as u64);
+            if self.tail_frames_remaining == 0 {
+                self.phase = PlayPhase::Finished;
+            }
+        } else {
+            let consumed_num = (step as u64) * self.samples_per_tick_den;
+            self.sample_accum_num -= consumed_num;
+        }
     }
 
     fn reset_tracks(&mut self) {
@@ -675,6 +886,7 @@ impl HowlPlayer {
                     active: !track.events.is_empty(),
                     percussion: track.is_percussion(),
                     loop_enabled,
+                    pass_had_time: false,
                     id: track.id,
                     instrument: 0,
                     reverb: false,
@@ -716,10 +928,9 @@ impl HowlPlayer {
         };
         self.device
             .write_ps1_register(ps1::RVB_WORK_ADDR, work_addr_reg)?;
-        self.device
-            .write_ps1_register(ps1::MVOLL, self.config.master_volume)?;
-        self.device
-            .write_ps1_register(ps1::MVOLR, self.config.master_volume)?;
+        let mvol = self.config.master_volume & 0x7FFF;
+        self.device.write_ps1_register(ps1::MVOLL, mvol)?;
+        self.device.write_ps1_register(ps1::MVOLR, mvol)?;
         let depth_reg = if self.reverb_active {
             self.config.reverb_depth as u16
         } else {
@@ -736,17 +947,16 @@ impl HowlPlayer {
     }
 
     fn step_tick(&mut self) -> Result<()> {
-        // 1. Expire timed one-shot SFX voices (mirrors the 5-unit decrement in FUN_8002c208).
+        // 1. Expire timed one-shot SFX voices (5 ticks per 60 Hz frame).
         for vi in 0..VOICES_PER_CORE {
-            if let Some(mut v) = self.voices[vi] {
-                if v.kind == VoiceKind::Sfx {
+            if let Some(ref mut v) = self.voices[vi] {
+                if v.kind == VoiceKind::Sfx && !v.released {
                     if v.duration_remaining <= 5 {
                         self.staged[vi].dirty |= DIRTY_KOFF;
                         self.staged[vi].dirty &= !DIRTY_KON;
-                        self.voices[vi] = None;
+                        v.released = true;
                     } else {
                         v.duration_remaining -= 5;
-                        self.voices[vi] = Some(v);
                     }
                 }
             }
@@ -766,8 +976,11 @@ impl HowlPlayer {
                 self.commit_staged_registers()?;
                 return Ok(());
             }
+            let prev_seq_vol = self.sequence_volume_fp16 >> 16;
             self.sequence_volume_fp16 = self.sequence_volume_fp16.saturating_sub(self.fade_step_fp16);
-            self.refresh_all_music_volumes();
+            if (self.sequence_volume_fp16 >> 16) != prev_seq_vol {
+                self.refresh_all_music_volumes();
+            }
         }
 
         // 3. Advance fixed-point tempo accumulator (16.16) and process track events.
@@ -788,6 +1001,9 @@ impl HowlPlayer {
             {
                 guard += 1;
                 let wait = self.tracks[ti].wait_ticks;
+                if wait > 0 {
+                    self.tracks[ti].pass_had_time = true;
+                }
                 self.tracks[ti].elapsed_ticks = self.tracks[ti].elapsed_ticks.saturating_sub(wait);
                 let ev_idx = self.tracks[ti].event_index;
                 let event = self.song_set.sequences[self.sequence_index].tracks[ti]
@@ -858,10 +1074,11 @@ impl HowlPlayer {
                 self.tracks[ti].event_index += 1;
             }
             HowlCommand::EndOfTrack => {
-                if self.tracks[ti].loop_enabled {
+                if self.tracks[ti].loop_enabled && self.tracks[ti].pass_had_time {
                     self.tracks[ti].loops_completed =
                         self.tracks[ti].loops_completed.saturating_add(1);
                     self.tracks[ti].event_index = 0;
+                    self.tracks[ti].pass_had_time = false;
                 } else {
                     self.tracks[ti].active = false;
                     self.release_track(ti);
@@ -912,7 +1129,7 @@ impl HowlPlayer {
         if self.config.music_volume == 0 || trk.volume == 0 || seq_vol == 0 || velocity == 0 {
             return;
         }
-        let (ssa_bytes, adsr1, adsr2, pitch, inst_vol) = if trk.percussion {
+        let (ssa_bytes, adsr1, adsr2, base_pitch, pitch, inst_vol) = if trk.percussion {
             let Some(&drum) = self.song_set.percussion.get(usize::from(note)) else {
                 return;
             };
@@ -924,6 +1141,7 @@ impl HowlPlayer {
                 ssa,
                 DEFAULT_PERCUSSION_ADSR1,
                 DEFAULT_PERCUSSION_ADSR2,
+                drum.base_pitch,
                 pitch,
                 drum.volume,
             )
@@ -935,7 +1153,7 @@ impl HowlPlayer {
                 return;
             };
             let pitch = compute_melodic_pitch(inst.base_pitch, note, trk.pitch_bend);
-            (ssa, inst.adsr1, inst.adsr2, pitch, inst.volume)
+            (ssa, inst.adsr1, inst.adsr2, inst.base_pitch, pitch, inst.volume)
         };
 
         let Some(vi) = self.allocate_voice() else {
@@ -950,8 +1168,10 @@ impl HowlPlayer {
             note,
             velocity,
             instrument_volume: inst_vol,
+            base_pitch,
             duration_remaining: 0,
             age: self.voice_clock,
+            released: false,
         });
         let reg = &mut self.staged[vi];
         reg.dirty |= DIRTY_ALL_NOTE_ON;
@@ -966,11 +1186,12 @@ impl HowlPlayer {
 
     fn release_note(&mut self, ti: usize, note: u8) {
         for vi in 0..VOICES_PER_CORE {
-            if let Some(v) = self.voices[vi] {
-                if v.kind == VoiceKind::Music && v.track_index == ti && v.note == note {
+            if let Some(ref mut v) = self.voices[vi] {
+                if !v.released && v.kind == VoiceKind::Music && v.track_index == ti && v.note == note
+                {
                     self.staged[vi].dirty |= DIRTY_KOFF;
                     self.staged[vi].dirty &= !DIRTY_KON;
-                    self.voices[vi] = None;
+                    v.released = true;
                 }
             }
         }
@@ -978,11 +1199,11 @@ impl HowlPlayer {
 
     fn release_track(&mut self, ti: usize) {
         for vi in 0..VOICES_PER_CORE {
-            if let Some(v) = self.voices[vi] {
-                if v.kind == VoiceKind::Music && v.track_index == ti {
+            if let Some(ref mut v) = self.voices[vi] {
+                if !v.released && v.kind == VoiceKind::Music && v.track_index == ti {
                     self.staged[vi].dirty |= DIRTY_KOFF;
                     self.staged[vi].dirty &= !DIRTY_KON;
-                    self.voices[vi] = None;
+                    v.released = true;
                 }
             }
         }
@@ -990,41 +1211,76 @@ impl HowlPlayer {
 
     fn key_off_all_music(&mut self) {
         for vi in 0..VOICES_PER_CORE {
-            if let Some(v) = self.voices[vi] {
-                if v.kind == VoiceKind::Music {
+            if let Some(ref mut v) = self.voices[vi] {
+                if !v.released && v.kind == VoiceKind::Music {
                     self.staged[vi].dirty |= DIRTY_KOFF;
                     self.staged[vi].dirty &= !DIRTY_KON;
-                    self.voices[vi] = None;
+                    v.released = true;
                 }
             }
         }
     }
 
+    /// 3-tier 24-voice allocator (skipping slots already pending `KON` on this tick):
+    /// 1. First unowned or hardware-stopped slot (`Stopped` or `reached_end && envx == 0`).
+    /// 2. Oldest released slot (actively decaying in ADSR release).
+    /// 3. Oldest active slot.
     fn allocate_voice(&self) -> Option<usize> {
+        // Tier 1: unowned or hardware-stopped slot.
         for vi in 0..VOICES_PER_CORE {
+            if (self.staged[vi].dirty & DIRTY_KON) != 0 {
+                continue;
+            }
             if self.voices[vi].is_none() {
                 return Some(vi);
             }
+            if let Ok(st) = self.device.inspect_voice(0, vi) {
+                if st.envelope_phase == EnvelopePhase::Stopped || (st.reached_end && st.envx == 0) {
+                    return Some(vi);
+                }
+            }
         }
-        // Fallback: steal the oldest voice so polyphonic passages never deadlock.
-        self.voices
-            .iter()
-            .enumerate()
-            .filter_map(|(vi, slot)| slot.map(|v| (vi, v.age)))
-            .min_by_key(|&(_, age)| age)
-            .map(|(vi, _)| vi)
+
+        // Tier 2: oldest released slot.
+        let mut best_released: Option<(usize, u64)> = None;
+        for vi in 0..VOICES_PER_CORE {
+            if (self.staged[vi].dirty & DIRTY_KON) != 0 {
+                continue;
+            }
+            if let Some(v) = self.voices[vi] {
+                if v.released && best_released.map_or(true, |(_, age)| v.age < age) {
+                    best_released = Some((vi, v.age));
+                }
+            }
+        }
+        if let Some((vi, _)) = best_released {
+            return Some(vi);
+        }
+
+        // Tier 3: oldest active slot.
+        let mut best_active: Option<(usize, u64)> = None;
+        for vi in 0..VOICES_PER_CORE {
+            if (self.staged[vi].dirty & DIRTY_KON) != 0 {
+                continue;
+            }
+            if let Some(v) = self.voices[vi] {
+                if best_active.map_or(true, |(_, age)| v.age < age) {
+                    best_active = Some((vi, v.age));
+                }
+            }
+        }
+        best_active.map(|(vi, _)| vi)
     }
 
     fn is_track_muted(&self, ti: usize) -> bool {
         if ti >= 64 {
-            return false;
+            return self.solo_mask != 0;
         }
         let bit = 1u64 << ti;
-        if self.solo_mask != 0 {
-            (self.solo_mask & bit) == 0
-        } else {
-            (self.mute_mask & bit) != 0
+        if (self.mute_mask & bit) != 0 {
+            return true;
         }
+        self.solo_mask != 0 && (self.solo_mask & bit) == 0
     }
 
     fn compute_music_voice_volume(&self, ti: usize, inst_vol: u8, velocity: u8) -> (i16, i16) {
@@ -1044,17 +1300,32 @@ impl HowlPlayer {
                 if v.kind == VoiceKind::Music && v.track_index == ti {
                     let (vol_l, vol_r) =
                         self.compute_music_voice_volume(ti, v.instrument_volume, v.velocity);
-                    self.staged[vi].vol_l = vol_l;
-                    self.staged[vi].vol_r = vol_r;
-                    self.staged[vi].dirty |= DIRTY_VOLUME;
+                    if (vol_l, vol_r) != (self.staged[vi].vol_l, self.staged[vi].vol_r) {
+                        self.staged[vi].vol_l = vol_l;
+                        self.staged[vi].vol_r = vol_r;
+                        self.staged[vi].dirty |= DIRTY_VOLUME;
+                    }
                 }
             }
         }
     }
 
     fn refresh_all_music_volumes(&mut self) {
-        for ti in 0..self.tracks.len() {
-            self.refresh_track_volumes(ti);
+        for vi in 0..VOICES_PER_CORE {
+            if let Some(v) = self.voices[vi] {
+                if v.kind == VoiceKind::Music {
+                    let (vol_l, vol_r) = self.compute_music_voice_volume(
+                        v.track_index,
+                        v.instrument_volume,
+                        v.velocity,
+                    );
+                    if (vol_l, vol_r) != (self.staged[vi].vol_l, self.staged[vi].vol_r) {
+                        self.staged[vi].vol_l = vol_l;
+                        self.staged[vi].vol_r = vol_r;
+                        self.staged[vi].dirty |= DIRTY_VOLUME;
+                    }
+                }
+            }
         }
     }
 
@@ -1062,20 +1333,14 @@ impl HowlPlayer {
         let trk = self.tracks[ti];
         for vi in 0..VOICES_PER_CORE {
             if let Some(v) = self.voices[vi] {
-                if v.kind == VoiceKind::Music && v.track_index == ti {
+                if v.kind == VoiceKind::Music && v.track_index == ti && !v.released {
                     let pitch = if trk.percussion {
-                        self.song_set
-                            .percussion
-                            .get(usize::from(v.note))
-                            .map(|d| compute_percussion_pitch(d.base_pitch, trk.pitch_bend))
+                        compute_percussion_pitch(v.base_pitch, trk.pitch_bend)
                     } else {
-                        self.song_set
-                            .instruments
-                            .get(usize::from(trk.instrument))
-                            .map(|i| compute_melodic_pitch(i.base_pitch, v.note, trk.pitch_bend))
+                        compute_melodic_pitch(v.base_pitch, v.note, trk.pitch_bend)
                     };
-                    if let Some(p) = pitch {
-                        self.staged[vi].pitch = p;
+                    if pitch != self.staged[vi].pitch {
+                        self.staged[vi].pitch = pitch;
                         self.staged[vi].dirty |= DIRTY_PITCH;
                     }
                 }
@@ -1100,11 +1365,7 @@ impl HowlPlayer {
         for (vi, reg) in self.staged.iter_mut().enumerate() {
             if (reg.dirty & DIRTY_KOFF) != 0 {
                 koff_mask |= 1u32 << vi;
-                if (reg.dirty & DIRTY_KON) == 0 {
-                    reg.dirty = 0;
-                } else {
-                    reg.dirty &= !DIRTY_KOFF;
-                }
+                reg.dirty &= !DIRTY_KOFF;
             }
         }
         if koff_mask != 0 {
@@ -1174,17 +1435,6 @@ impl HowlPlayer {
         }
         Ok(())
     }
-}
-
-/// Computes the 16.16 fixed-point ticks-per-frame increment `(((bpm * tpqn) / 60) << 16) / tick_hz`.
-#[inline]
-#[must_use]
-pub const fn compute_tempo_fp16(bpm: u16, tpqn: u16, tick_hz: u32) -> u32 {
-    if tick_hz == 0 {
-        return 0;
-    }
-    let ticks_per_sec = ((bpm as u64) * (tpqn as u64)) / 60;
-    ((ticks_per_sec << 16) / (tick_hz as u64)) as u32
 }
 
 fn validate_config(config: &RenderConfig) -> Result<()> {
